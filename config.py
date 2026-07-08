@@ -1,37 +1,92 @@
 """
 Configuration for the NGS360 Chat Service.
 
-Standalone settings (env / .env), independent of the REST API's config module so
-this service has no import coupling to APIServer.
+Resolves each value from (1) an environment variable, then (2) an AWS Secrets
+Manager secret named by ENV_SECRETS — the same convention the REST API uses
+(core/config.py) so secrets (LLM_API_KEY, JWT_SECRET_KEY) are never stored as
+plaintext env properties in Elastic Beanstalk. Falls back to a default.
 """
 
+import json
+import os
 from functools import lru_cache
+from pathlib import Path
 
-from pydantic_settings import BaseSettings, SettingsConfigDict
+import boto3
+from botocore.exceptions import ClientError
+from dotenv import load_dotenv
+
+# Load a local .env (dev convenience) before settings are read.
+_env_path = Path(__file__).parent / ".env"
+if _env_path.exists():
+    load_dotenv(_env_path)
 
 
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        case_sensitive=False,
-        extra="ignore",
+def get_secret(secret_name: str, region_name: str) -> dict | None:
+    """Fetch and parse a JSON secret from AWS Secrets Manager."""
+    client = boto3.session.Session().client(
+        service_name="secretsmanager", region_name=region_name
     )
+    try:
+        response = client.get_secret_value(SecretId=secret_name)
+    except ClientError:
+        return None
+    return json.loads(response["SecretString"].replace("\n", ""))
+
+
+class Settings:
+    """Env-or-SecretsManager-backed settings (mirrors the REST API pattern)."""
+
+    def __init__(self) -> None:
+        self._secret_cache: dict | None = None
+
+    def _get(self, name: str, default: str | None = None) -> str | None:
+        env_value = os.getenv(name)
+        if env_value:
+            return env_value
+        if self._secret_cache is None:
+            env_secret = os.getenv("ENV_SECRETS")
+            if env_secret:
+                self._secret_cache = get_secret(
+                    env_secret, os.getenv("AWS_REGION", "us-east-1")
+                )
+        if self._secret_cache:
+            value = self._secret_cache.get(name)
+            if value is not None:
+                return value
+        return default
 
     # LLM gateway (Anthropic-compatible endpoint is <base>/anthropic).
-    LLM_BASE_URL: str = ""
-    LLM_API_KEY: str = ""
-    LLM_MODEL: str = "claude-opus-4-8"
+    @property
+    def LLM_BASE_URL(self) -> str | None:
+        return self._get("LLM_BASE_URL")
+
+    @property
+    def LLM_API_KEY(self) -> str | None:
+        return self._get("LLM_API_KEY")
+
+    @property
+    def LLM_MODEL(self) -> str:
+        return self._get("LLM_MODEL", default="claude-opus-4-8")
 
     # Shared with the REST API so its JWTs verify here.
-    JWT_SECRET_KEY: str = "change-this-secret-key-in-production"
-    JWT_ALGORITHM: str = "HS256"
+    @property
+    def JWT_SECRET_KEY(self) -> str:
+        return self._get("JWT_SECRET_KEY", default="change-this-secret-key-in-production")
+
+    @property
+    def JWT_ALGORITHM(self) -> str:
+        return self._get("JWT_ALGORITHM", default="HS256")
 
     # REST API base used by the agent's data-lookup tools.
-    NGS360_API_URL: str = "http://localhost:3000/api/v1"
+    @property
+    def NGS360_API_URL(self) -> str:
+        return self._get("NGS360_API_URL", default="http://localhost:3000/api/v1")
 
     # CORS allowed origin (the frontend).
-    CLIENT_ORIGIN: str | None = None
+    @property
+    def CLIENT_ORIGIN(self) -> str | None:
+        return self._get("CLIENT_ORIGIN")
 
 
 @lru_cache
